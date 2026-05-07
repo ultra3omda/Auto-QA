@@ -11,6 +11,7 @@ anthropic>=0.40.0
 # Backend & data
 supabase>=2.5.0
 pandas>=2.2.0
+openpyxl>=3.1.0   # lecture .xlsx (pandas read_excel)
 
 # Config
 python-dotenv>=1.0.1

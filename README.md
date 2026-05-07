@@ -55,6 +55,70 @@ cp .env.example .env       # éditer les secrets
 psql "$SUPABASE_DB_URL" -f schema.sql
 ```
 
+## 🚀 Démarrer (procédure complète)
+
+```bash
+# 0. environnement (une seule fois)
+source .venv/bin/activate
+
+# 1. créer le schéma Supabase
+psql "$SUPABASE_DB_URL" -f schema.sql
+
+# 2. importer les deals (.xlsx ou .csv) — ~1 044 deals utilisables
+python scripts/import_csv.py "data/Liste des deals Freelance Stack .xlsx"
+
+# 3. lancer le cron QA — une seule passe, intended-for-cron
+python main.py
+
+# ou en boucle continue (debug) — repasse toutes les 60 s
+python main.py --loop --sleep 60
+```
+
+Pour planifier sur une vraie crontab (toutes les heures par exemple) :
+
+```cron
+0 * * * * cd /home/imed/Bureau/Auto-QA && /home/imed/Bureau/Auto-QA/.venv/bin/python main.py >> auto-qa.log 2>&1
+```
+
+## 📊 Suivi temps-réel
+
+Trois façons de regarder ce qui se passe pendant que le cron tourne :
+
+```bash
+# 1. Tableau de bord rich (plein écran, refresh 5 s)
+python scripts/monitor.py
+
+# 2. Variante scriptable (pas d'alt-screen, défilement standard)
+python scripts/monitor.py --plain
+
+# 3. Snapshot unique
+python scripts/monitor.py --once
+```
+
+Le moniteur affiche : total deals · `est_actif` count · répartition par
+`statut_test` · répartition par `tier` · les 20 derniers tests avec
+`raison_echec`.
+
+Suivi côté logs (à lancer dans un autre terminal) :
+
+```bash
+tail -f auto-qa.log
+```
+
+Suivi SQL ad-hoc dans Supabase Studio :
+
+```sql
+-- Tests réalisés dans la dernière heure
+SELECT date_dernier_test, nom_partenaire, tier, statut_test, raison_echec
+FROM deals_saas
+WHERE date_dernier_test > NOW() - INTERVAL '1 hour'
+ORDER BY date_dernier_test DESC;
+
+-- Deals à retester maintenant
+SELECT COUNT(*) FROM deals_saas
+WHERE date_prochain_test <= NOW() OR statut_test = 'EN_ATTENTE';
+```
+
 ## Variables d'environnement
 
 Toutes définies dans `.env` (cf. `.env.example`). Les plus sensibles :
