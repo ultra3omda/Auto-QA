@@ -1,0 +1,15 @@
+# Agent & navigation
+browser-use>=0.1.40
+playwright>=1.45
+browserbase>=1.0.0
+
+# LLM
+anthropic>=0.40.0
+langchain-anthropic>=0.2.0
+
+# Backend & data
+supabase>=2.5.0
+pandas>=2.2.0
+
+# Config
+python-dotenv>=1.0.1
