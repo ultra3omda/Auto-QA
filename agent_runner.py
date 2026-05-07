@@ -27,7 +27,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from browser_use import Agent, Browser, BrowserConfig
+from browser_use import Agent, BrowserSession
 from browserbase import Browserbase
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
@@ -151,7 +151,7 @@ async def run_qa_for_deal(
     `WAITING_FOR_EMAIL_CODE` checkpoint.
     """
     connect_url = reuse_session_url or _create_browserbase_session()
-    browser = Browser(config=BrowserConfig(cdp_url=connect_url))
+    session = BrowserSession(cdp_url=connect_url)
 
     llm = ChatAnthropic(
         model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
@@ -174,8 +174,8 @@ async def run_qa_for_deal(
     agent = Agent(
         task=objective,
         llm=llm,
-        browser=browser,
-        message_context=_build_system_prompt(),
+        browser_session=session,
+        extend_system_message=_build_system_prompt(),
     )
 
     try:
@@ -192,7 +192,7 @@ async def run_qa_for_deal(
         )
     finally:
         try:
-            await browser.close()
+            await session.stop()
         except Exception:
             pass
 
