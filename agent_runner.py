@@ -27,10 +27,9 @@ import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from browser_use import Agent, BrowserSession
+from browser_use import Agent, BrowserSession, ChatAnthropic
 from browserbase import Browserbase
 from dotenv import load_dotenv
-from langchain_anthropic import ChatAnthropic
 
 load_dotenv()
 log = logging.getLogger(__name__)
