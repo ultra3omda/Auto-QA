@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -115,6 +116,73 @@ class AgentResult:
     session_url: Optional[str] = None
 
 
+# ---------------------------------------------------------------------------
+# URL pre-filter + history sentinel scan
+#
+# Le 1er batch a montré que browser-use perd le sentinel WAITING_FOR_EMAIL_CODE
+# quand l'agent stoppe sur "5 consecutive failures" (CDP timeouts Browserbase) :
+# `history.final_result()` ne contient que la dernière action, le sentinel
+# émis aux steps précédents disparaît. Solution : scanner toute l'historique.
+# Et : pre-filtrer les URLs meeting/demo (HubSpot, Calendly, ...) AVANT même
+# d'ouvrir une session, puisqu'on sait que l'agent ne pourra pas en sortir.
+# ---------------------------------------------------------------------------
+
+UNTESTABLE_URL_PATTERNS: tuple[re.Pattern, ...] = (
+    re.compile(r"meetings\.hubspot\.com",   re.IGNORECASE),
+    re.compile(r"calendly\.com",            re.IGNORECASE),
+    re.compile(r"cal\.com/",                re.IGNORECASE),
+    re.compile(r"savvycal\.com",            re.IGNORECASE),
+    re.compile(r"/(book-a-demo|book-demo|demo-request|contact-sales|"
+               r"talk-to-sales|schedule-a-demo)/?",
+               re.IGNORECASE),
+)
+
+# Le format strict (`WAITING_FOR_EMAIL_CODE:` + alias email) évite les faux
+# positifs où l'agent ne fait que mentionner le sentinel dans son raisonnement.
+SENTINEL_PATTERNS: dict[str, re.Pattern] = {
+    "untestable":   re.compile(r"\[UNTESTABLE_WALL\]"),
+    "require_paid": re.compile(r"REQUIRE_PAID_SUBSCRIPTION"),
+    "needs_otp":    re.compile(r"WAITING_FOR_EMAIL_CODE:\s*\S+@\S+"),
+}
+
+
+def _pre_filter_url(url: str) -> Optional[str]:
+    """Return an [UNTESTABLE_WALL] reason string if `url` is a known
+    meeting / demo / contact-sales page; None otherwise."""
+    for rx in UNTESTABLE_URL_PATTERNS:
+        if rx.search(url or ""):
+            return (f"[UNTESTABLE_WALL] URL = page de RDV / contact-sales "
+                    f"(matched {rx.pattern!r})")
+    return None
+
+
+def _scan_history_for_sentinels(history: Any) -> dict[str, bool]:
+    """Walk every step's model_output for the three sentinels — robust to
+    agent crashes that erase the final_result()."""
+    flags = {k: False for k in SENTINEL_PATTERNS}
+    blob_parts: list[str] = []
+    try:
+        for item in getattr(history, "history", []) or []:
+            mo = getattr(item, "model_output", None)
+            for attr in ("long_term_memory", "next_goal",
+                         "evaluation_previous_goal", "thinking"):
+                v = getattr(mo, attr, None)
+                if v:
+                    blob_parts.append(str(v))
+        try:
+            fr = history.final_result()
+            if fr:
+                blob_parts.append(str(fr))
+        except Exception:
+            pass
+    except Exception:
+        log.debug("Sentinel scan failed", exc_info=True)
+    blob = "\n".join(blob_parts)
+    for k, rx in SENTINEL_PATTERNS.items():
+        flags[k] = bool(rx.search(blob))
+    return flags
+
+
 def _build_system_prompt() -> str:
     cc_rule = PAYMENT_RULE_TPL.format(
         number=os.environ.get("QA_CC_NUMBER", ""),
@@ -149,6 +217,19 @@ async def run_qa_for_deal(
     Pass `prefilled_otp` + `reuse_session_url` to resume after a
     `WAITING_FOR_EMAIL_CODE` checkpoint.
     """
+    # Fix 2 — pre-filtre meeting/demo URLs : on sait d'avance qu'aucun checkout
+    # ne sortira de là. Inutile de cramer une session Browserbase + 30 steps LLM.
+    if not reuse_session_url:
+        untestable_reason = _pre_filter_url(target_url)
+        if untestable_reason:
+            log.info("Pre-filter UNTESTABLE for %s : %s", target_url, untestable_reason)
+            return AgentResult(
+                success=False,
+                screenshot_b64=None,
+                raw_output=untestable_reason,
+                untestable=True,
+            )
+
     connect_url = reuse_session_url or _create_browserbase_session()
     session = BrowserSession(cdp_url=connect_url)
 
@@ -196,11 +277,14 @@ async def run_qa_for_deal(
             pass
 
     text = _coerce_to_text(history)
-    if "[UNTESTABLE_WALL]" in text:
+    # Fix 1 — scanner toute l'AgentHistory, pas juste final_result(), parce que
+    # browser-use perd le dernier sentinel quand l'agent stoppe sur "5 failures".
+    flags = _scan_history_for_sentinels(history)
+    if flags["untestable"]:
         return AgentResult(False, None, text, untestable=True, session_url=connect_url)
-    if "REQUIRE_PAID_SUBSCRIPTION" in text:
+    if flags["require_paid"]:
         return AgentResult(False, None, text, requires_paid=True, session_url=connect_url)
-    if "WAITING_FOR_EMAIL_CODE" in text and not prefilled_otp:
+    if flags["needs_otp"] and not prefilled_otp:
         return AgentResult(False, None, text, needs_otp=True, session_url=connect_url)
 
     screenshot = _extract_screenshot(history)
