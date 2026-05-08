@@ -32,6 +32,8 @@ from browser_use import Agent, BrowserSession, ChatAnthropic
 from browserbase import Browserbase
 from dotenv import load_dotenv
 
+from captcha_solver import solve_captcha_on_page
+
 load_dotenv()
 log = logging.getLogger(__name__)
 
@@ -194,12 +196,27 @@ def _build_system_prompt() -> str:
 
 
 def _create_browserbase_session() -> str:
-    """Provision a Browserbase session and return the WSS connect URL."""
+    """Provision a Browserbase session with captcha-bypass enabled.
+
+    Flags utilisables sur le plan free :
+      - solve_captchas : Browserbase résout hCaptcha / reCAPTCHA pour nous.
+      - block_ads      : moins de bruit dans les pages, sessions plus rapides.
+
+    NB : `advanced_stealth` (anti-fingerprint) et `proxies=True` (proxy
+    résidentiel) sont réservés aux plans payants. Sans eux, certains sites
+    peuvent encore bloquer sur fingerprint ou IP datacenter — mais
+    solve_captchas couvre déjà l'essentiel des défenses anti-bot.
+    """
     bb = Browserbase(api_key=os.environ["BROWSERBASE_API_KEY"])
     session = bb.sessions.create(
         project_id=os.environ["BROWSERBASE_PROJECT_ID"],
+        browser_settings={
+            "solve_captchas": True,
+            "block_ads": True,
+        },
     )
-    log.info("Browserbase session opened: %s", getattr(session, "id", "?"))
+    log.info("Browserbase session opened: %s (captcha=on, block_ads=on)",
+             getattr(session, "id", "?"))
     return session.connect_url
 
 
@@ -230,8 +247,20 @@ async def run_qa_for_deal(
                 untestable=True,
             )
 
-    connect_url = reuse_session_url or _create_browserbase_session()
-    session = BrowserSession(cdp_url=connect_url)
+    # AGENT_LOCAL_BROWSER=1 (défaut) → Chromium local via Playwright.
+    # Browserbase free-tier est trop instable côté WebSocket sur le 1er batch
+    # (6/8 deals ont crashé sur HTTP 410 / "5 consecutive failures"). Le
+    # bypass captcha est désormais assuré côté local par captcha_solver.py
+    # qui appelle CapSolver à chaque step si un hCaptcha/reCAPTCHA est détecté.
+    # Mettre AGENT_LOCAL_BROWSER=0 pour forcer Browserbase (debug).
+    use_local = os.getenv("AGENT_LOCAL_BROWSER", "1") in ("1", "true", "yes")
+    if use_local:
+        log.info("AGENT_LOCAL_BROWSER=1 → Playwright local (pas de Browserbase)")
+        session = BrowserSession(headless=True)
+        connect_url = "local"
+    else:
+        connect_url = reuse_session_url or _create_browserbase_session()
+        session = BrowserSession(cdp_url=connect_url)
 
     llm = ChatAnthropic(
         model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
@@ -256,6 +285,7 @@ async def run_qa_for_deal(
         llm=llm,
         browser_session=session,
         extend_system_message=_build_system_prompt(),
+        register_new_step_callback=_captcha_step_callback,
     )
 
     try:
@@ -294,6 +324,31 @@ async def run_qa_for_deal(
         raw_output=text,
         session_url=connect_url,
     )
+
+
+async def _captcha_step_callback(*args: Any, **kwargs: Any) -> None:
+    """browser-use step hook : tente de résoudre tout captcha sur la page.
+
+    Signature volontairement permissive — browser-use 0.12.x peut passer
+    différents types (Agent, BrowserSession, page, …) selon les versions.
+    On pioche le premier argument qui expose une page Playwright.
+    """
+    try:
+        page = None
+        # 1) browser-use peut nous donner directement un browser_session
+        for arg in list(args) + list(kwargs.values()):
+            if arg is None:
+                continue
+            bs = getattr(arg, "browser_session", arg)
+            getter = getattr(bs, "get_current_page", None)
+            if getter:
+                page = await getter()
+                break
+        if page is None:
+            return
+        await solve_captcha_on_page(page)
+    except Exception as exc:  # pragma: no cover — diagnostic only
+        log.debug("Captcha step callback failed: %s", exc)
 
 
 def _coerce_to_text(history: Any) -> str:
