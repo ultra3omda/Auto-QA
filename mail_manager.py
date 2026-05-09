@@ -21,7 +21,10 @@ load_dotenv()
 log = logging.getLogger(__name__)
 
 
-OTP_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+# Codes OTP : 4 à 8 chiffres avec frontières non-numériques.
+# Capsule CRM envoie 4 chiffres dans le subject ("[Capsule] 1065 is your..."),
+# Stripe envoie 6 chiffres, Google 6, certains sites 8.
+OTP_RE = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
 LINK_RE = re.compile(r"https?://[^\s\"'<>)]+", re.IGNORECASE)
 EXCLUDE_LINK_HINTS = (
     "unsubscribe", "preferences", "manage-subscription", "manage_subscription",
@@ -44,7 +47,23 @@ def _decode(payload: str | bytes | None) -> str:
 
 
 def _msg_text(msg: Message) -> str:
+    """Concat subject + body — beaucoup de mails OTP (Capsule CRM, GitHub,
+    AWS, etc.) mettent le code dans le subject, pas dans le body."""
     parts: list[str] = []
+    subject = msg.get("Subject")
+    if subject:
+        # Décoder les en-têtes encodés MIME (=?utf-8?q?...?=)
+        try:
+            from email.header import decode_header
+            chunks = decode_header(subject)
+            decoded = "".join(
+                (c[0].decode(c[1] or "utf-8", errors="replace")
+                 if isinstance(c[0], bytes) else c[0])
+                for c in chunks
+            )
+            parts.append(decoded)
+        except Exception:
+            parts.append(str(subject))
     if msg.is_multipart():
         for part in msg.walk():
             if part.get_content_type() in ("text/plain", "text/html"):

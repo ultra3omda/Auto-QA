@@ -64,17 +64,31 @@ async def solve_captcha_on_page(page) -> bool:
     if not api_key or api_key.startswith("A_REMPLIR"):
         return False  # silencieux : pas de clé, on ne fait rien
 
+    # browser_use 0.12.x evaluate() retourne TOUJOURS un str (JSON pour
+    # arrays/objects). On fait donc le json.loads côté Python.
+    import json as _json
     try:
-        site_key, kind = await page.evaluate(_DETECT_JS)
+        raw = await page.evaluate(_DETECT_JS)
     except Exception as exc:
-        log.debug("Captcha detect failed: %s", exc)
+        log.warning("Captcha detect failed: %s", exc)
         return False
+    try:
+        parsed = _json.loads(raw) if raw else [None, None]
+    except Exception:
+        parsed = [None, None]
+    if not isinstance(parsed, (list, tuple)) or len(parsed) < 2:
+        return False
+    site_key, kind = parsed[0], parsed[1]
 
     if not site_key:
         return False
+    log.info("Captcha widget trouvé sur la page : kind=%s site_key=%s",
+             kind, str(site_key)[:12])
 
-    page_url = page.url
-    log.info("Captcha détecté sur %s : %s site_key=%s", page_url, kind, site_key[:12])
+    try:
+        page_url = await page.get_url()
+    except Exception:
+        page_url = ""
 
     token = await _solve_via_capsolver(api_key, kind, page_url, site_key)
     if not token:
@@ -102,36 +116,46 @@ async def _solve_via_capsolver(
     site_key: str,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Optional[str]:
-    task_type = (
-        "HCaptchaTaskProxyless"
-        if kind == "hcaptcha"
-        else "ReCaptchaV2TaskProxyless"
-    )
-    payload_create = {
-        "clientKey": api_key,
-        "task": {
-            "type": task_type,
-            "websiteURL": page_url,
-            "websiteKey": site_key,
-        },
-    }
+    """Task types CapSolver supportés (liste officielle docs.capsolver.com).
+    Pas de variant 'Enterprise' chez CapSolver — c'est juste 'Proxyless'."""
+    if kind == "hcaptcha":
+        task_types = ("HCaptchaTaskProxyless",)
+    else:
+        task_types = ("ReCaptchaV2TaskProxyless",)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            resp = await client.post(f"{CAPSOLVER_API}/createTask", json=payload_create)
-            data = resp.json()
-        except Exception as exc:
-            log.warning("CapSolver createTask network error: %s", exc)
-            return None
+        task_id = None
+        for task_type in task_types:
+            payload_create = {
+                "clientKey": api_key,
+                "task": {
+                    "type": task_type,
+                    "websiteURL": page_url,
+                    "websiteKey": site_key,
+                },
+            }
+            try:
+                resp = await client.post(f"{CAPSOLVER_API}/createTask", json=payload_create)
+                data = resp.json()
+            except Exception as exc:
+                log.warning("CapSolver createTask network error: %s", exc)
+                return None
 
-        if data.get("errorId"):
-            log.warning("CapSolver createTask: %s — %s",
-                        data.get("errorCode"), data.get("errorDescription"))
-            return None
+            if not data.get("errorId"):
+                task_id = data.get("taskId")
+                if task_id:
+                    log.info("CapSolver task créée (type=%s, id=%s)",
+                             task_type, str(task_id)[:8])
+                    break
 
-        task_id = data.get("taskId")
+            err_code = data.get("errorCode", "")
+            log.warning("CapSolver createTask (%s): %s — %s",
+                        task_type, err_code, data.get("errorDescription"))
+            # Enterprise refusé → on tente le basic
+            if err_code != "ERROR_INVALID_TASK_DATA":
+                return None  # autres erreurs : pas la peine d'essayer le fallback
+
         if not task_id:
-            log.warning("CapSolver: pas de taskId dans la réponse: %s", data)
             return None
 
         loop = asyncio.get_event_loop()

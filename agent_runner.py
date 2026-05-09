@@ -280,12 +280,32 @@ async def run_qa_for_deal(
             value=prefilled_otp,
         )
 
+    # Closure step-callback : à chaque step, on tente de résoudre le captcha
+    # sur la page courante. browser-use 0.12.6 invoque le callback avec
+    # (BrowserStateSummary, AgentOutput, n_steps) — donc on récupère la
+    # page via la `session` capturée plutôt que via les arguments.
+    async def _captcha_cb(state_summary, model_output, n_steps):
+        try:
+            page = await session.get_current_page()
+            if page is None:
+                return
+            try:
+                url = await page.get_url()
+            except Exception:
+                url = "?"
+            log.info("step %d captcha-cb fired (url=%s)", n_steps, url[:80])
+            solved = await solve_captcha_on_page(page)
+            if solved:
+                log.info("step %d : captcha résolu via CapSolver", n_steps)
+        except Exception as exc:
+            log.warning("step %d captcha cb failed: %s", n_steps, exc)
+
     agent = Agent(
         task=objective,
         llm=llm,
         browser_session=session,
         extend_system_message=_build_system_prompt(),
-        register_new_step_callback=_captcha_step_callback,
+        register_new_step_callback=_captcha_cb,
     )
 
     try:
@@ -324,31 +344,6 @@ async def run_qa_for_deal(
         raw_output=text,
         session_url=connect_url,
     )
-
-
-async def _captcha_step_callback(*args: Any, **kwargs: Any) -> None:
-    """browser-use step hook : tente de résoudre tout captcha sur la page.
-
-    Signature volontairement permissive — browser-use 0.12.x peut passer
-    différents types (Agent, BrowserSession, page, …) selon les versions.
-    On pioche le premier argument qui expose une page Playwright.
-    """
-    try:
-        page = None
-        # 1) browser-use peut nous donner directement un browser_session
-        for arg in list(args) + list(kwargs.values()):
-            if arg is None:
-                continue
-            bs = getattr(arg, "browser_session", arg)
-            getter = getattr(bs, "get_current_page", None)
-            if getter:
-                page = await getter()
-                break
-        if page is None:
-            return
-        await solve_captcha_on_page(page)
-    except Exception as exc:  # pragma: no cover — diagnostic only
-        log.debug("Captcha step callback failed: %s", exc)
 
 
 def _coerce_to_text(history: Any) -> str:
