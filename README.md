@@ -85,7 +85,7 @@ Pour planifier sur une vraie crontab (toutes les heures par exemple) :
 Trois façons de regarder ce qui se passe pendant que le cron tourne :
 
 ```bash
-# 1. Tableau de bord rich (plein écran, refresh 5 s)
+# 1. Tableau de bord rich (plein écran, refresh 5 s) — capé à 1 000 lignes
 python scripts/monitor.py
 
 # 2. Variante scriptable (pas d'alt-screen, défilement standard)
@@ -98,6 +98,72 @@ python scripts/monitor.py --once
 Le moniteur affiche : total deals · `est_actif` count · répartition par
 `statut_test` · répartition par `tier` · les 20 derniers tests avec
 `raison_echec`.
+
+## 📑 Rapport final (au-delà du cap 1 000 REST)
+
+```bash
+# génère auto-qa-report.md + auto-qa-report.csv au repo root
+python scripts/report.py
+
+# vers stdout pour piper
+python scripts/report.py --md - | less
+
+# chemins custom
+python scripts/report.py --md ~/Desktop/qa.md --csv ~/Desktop/qa.csv
+```
+
+Le rapport pagine via `.range()` pour récupérer les **1 044 deals**
+(au-delà du cap 1 000 par défaut de PostgREST). Sections produites :
+
+- Total / testés / actifs / à tester
+- Répartition par statut + par tier
+- Tableau détaillé pour `VALIDE`, `INVALIDE_CODE_EXPIRE`,
+  `INVALIDE_LIEN_CASSE`, `A_VERIFIER_MANUELLEMENT`
+- Top 30 deals `EN_ATTENTE` (les plus populaires à tester en priorité)
+
+Le CSV s'ouvre directement dans Excel / Google Sheets.
+
+## ⏱️ Tester l'ensemble du catalogue
+
+```bash
+# Mode boucle continue — laisse tourner en tmux pour ne pas perdre la session
+tmux new -s auto-qa
+source .venv/bin/activate
+python main.py --loop --sleep 30
+# Ctrl+B puis D pour détacher
+
+# Reprendre la session
+tmux attach -t auto-qa
+```
+
+**Estimation pour 1 044 deals** :
+
+- **Temps** : 1 044 / `CRON_BATCH_SIZE` × ~30 min/batch (séquentiel)
+  ≈ 1 jour continu si `CRON_CONCURRENCY=1`. Augmenter `CRON_CONCURRENCY=3`
+  divise par 3 (~8 h) mais multiplie le risque captcha-burn.
+- **Coût Anthropic Sonnet 4.6** : ~1-2 USD par deal (30 steps × image
+  vision) → **~1 500 USD pour le catalogue entier**. Préférer une
+  stratégie progressive :
+
+```bash
+# TIER_1 d'abord (80 deals = ~150 USD, ~3 h) — gros noms, plus de valeur
+python -c "
+from data_manager import SupabaseManager
+db = SupabaseManager()
+db.client.table('deals_saas').update({'date_prochain_test':'2099-01-01'})\
+    .neq('tier','TIER_1').execute()
+"
+python main.py --loop --sleep 30
+# laisser tourner ~3 h, puis :
+python scripts/report.py
+```
+
+- **Coût CapSolver** : ~1 USD / 1 000 captchas → négligeable à l'échelle.
+- **Coût Browserbase** : 0 — on tourne en local Playwright (`AGENT_LOCAL_BROWSER=1`).
+- **Coût Supabase** : 0 (free tier suffit largement pour 1 044 lignes + writes).
+
+Lance `python scripts/report.py` régulièrement pour suivre la progression
+sans toucher au cron.
 
 Suivi côté logs (à lancer dans un autre terminal) :
 
