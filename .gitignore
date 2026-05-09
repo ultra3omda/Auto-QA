@@ -31,5 +31,11 @@ data/*.csv
 artifacts/
 screenshots/
 
+# Rapports régénérables (issus de scripts/report.py)
+auto-qa-report.md
+auto-qa-report.csv
+*-report.md
+*-report.csv
+
 # Logs
 *.log

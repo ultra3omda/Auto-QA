@@ -24,13 +24,15 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from browser_use import Agent, Browser, BrowserConfig
+from browser_use import Agent, BrowserSession, ChatAnthropic
 from browserbase import Browserbase
 from dotenv import load_dotenv
-from langchain_anthropic import ChatAnthropic
+
+from captcha_solver import solve_captcha_on_page
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -116,6 +118,73 @@ class AgentResult:
     session_url: Optional[str] = None
 
 
+# ---------------------------------------------------------------------------
+# URL pre-filter + history sentinel scan
+#
+# Le 1er batch a montré que browser-use perd le sentinel WAITING_FOR_EMAIL_CODE
+# quand l'agent stoppe sur "5 consecutive failures" (CDP timeouts Browserbase) :
+# `history.final_result()` ne contient que la dernière action, le sentinel
+# émis aux steps précédents disparaît. Solution : scanner toute l'historique.
+# Et : pre-filtrer les URLs meeting/demo (HubSpot, Calendly, ...) AVANT même
+# d'ouvrir une session, puisqu'on sait que l'agent ne pourra pas en sortir.
+# ---------------------------------------------------------------------------
+
+UNTESTABLE_URL_PATTERNS: tuple[re.Pattern, ...] = (
+    re.compile(r"meetings\.hubspot\.com",   re.IGNORECASE),
+    re.compile(r"calendly\.com",            re.IGNORECASE),
+    re.compile(r"cal\.com/",                re.IGNORECASE),
+    re.compile(r"savvycal\.com",            re.IGNORECASE),
+    re.compile(r"/(book-a-demo|book-demo|demo-request|contact-sales|"
+               r"talk-to-sales|schedule-a-demo)/?",
+               re.IGNORECASE),
+)
+
+# Le format strict (`WAITING_FOR_EMAIL_CODE:` + alias email) évite les faux
+# positifs où l'agent ne fait que mentionner le sentinel dans son raisonnement.
+SENTINEL_PATTERNS: dict[str, re.Pattern] = {
+    "untestable":   re.compile(r"\[UNTESTABLE_WALL\]"),
+    "require_paid": re.compile(r"REQUIRE_PAID_SUBSCRIPTION"),
+    "needs_otp":    re.compile(r"WAITING_FOR_EMAIL_CODE:\s*\S+@\S+"),
+}
+
+
+def _pre_filter_url(url: str) -> Optional[str]:
+    """Return an [UNTESTABLE_WALL] reason string if `url` is a known
+    meeting / demo / contact-sales page; None otherwise."""
+    for rx in UNTESTABLE_URL_PATTERNS:
+        if rx.search(url or ""):
+            return (f"[UNTESTABLE_WALL] URL = page de RDV / contact-sales "
+                    f"(matched {rx.pattern!r})")
+    return None
+
+
+def _scan_history_for_sentinels(history: Any) -> dict[str, bool]:
+    """Walk every step's model_output for the three sentinels — robust to
+    agent crashes that erase the final_result()."""
+    flags = {k: False for k in SENTINEL_PATTERNS}
+    blob_parts: list[str] = []
+    try:
+        for item in getattr(history, "history", []) or []:
+            mo = getattr(item, "model_output", None)
+            for attr in ("long_term_memory", "next_goal",
+                         "evaluation_previous_goal", "thinking"):
+                v = getattr(mo, attr, None)
+                if v:
+                    blob_parts.append(str(v))
+        try:
+            fr = history.final_result()
+            if fr:
+                blob_parts.append(str(fr))
+        except Exception:
+            pass
+    except Exception:
+        log.debug("Sentinel scan failed", exc_info=True)
+    blob = "\n".join(blob_parts)
+    for k, rx in SENTINEL_PATTERNS.items():
+        flags[k] = bool(rx.search(blob))
+    return flags
+
+
 def _build_system_prompt() -> str:
     cc_rule = PAYMENT_RULE_TPL.format(
         number=os.environ.get("QA_CC_NUMBER", ""),
@@ -127,12 +196,27 @@ def _build_system_prompt() -> str:
 
 
 def _create_browserbase_session() -> str:
-    """Provision a Browserbase session and return the WSS connect URL."""
+    """Provision a Browserbase session with captcha-bypass enabled.
+
+    Flags utilisables sur le plan free :
+      - solve_captchas : Browserbase résout hCaptcha / reCAPTCHA pour nous.
+      - block_ads      : moins de bruit dans les pages, sessions plus rapides.
+
+    NB : `advanced_stealth` (anti-fingerprint) et `proxies=True` (proxy
+    résidentiel) sont réservés aux plans payants. Sans eux, certains sites
+    peuvent encore bloquer sur fingerprint ou IP datacenter — mais
+    solve_captchas couvre déjà l'essentiel des défenses anti-bot.
+    """
     bb = Browserbase(api_key=os.environ["BROWSERBASE_API_KEY"])
     session = bb.sessions.create(
         project_id=os.environ["BROWSERBASE_PROJECT_ID"],
+        browser_settings={
+            "solve_captchas": True,
+            "block_ads": True,
+        },
     )
-    log.info("Browserbase session opened: %s", getattr(session, "id", "?"))
+    log.info("Browserbase session opened: %s (captcha=on, block_ads=on)",
+             getattr(session, "id", "?"))
     return session.connect_url
 
 
@@ -150,14 +234,48 @@ async def run_qa_for_deal(
     Pass `prefilled_otp` + `reuse_session_url` to resume after a
     `WAITING_FOR_EMAIL_CODE` checkpoint.
     """
-    connect_url = reuse_session_url or _create_browserbase_session()
-    browser = Browser(config=BrowserConfig(cdp_url=connect_url))
+    # Fix 2 — pre-filtre meeting/demo URLs : on sait d'avance qu'aucun checkout
+    # ne sortira de là. Inutile de cramer une session Browserbase + 30 steps LLM.
+    if not reuse_session_url:
+        untestable_reason = _pre_filter_url(target_url)
+        if untestable_reason:
+            log.info("Pre-filter UNTESTABLE for %s : %s", target_url, untestable_reason)
+            return AgentResult(
+                success=False,
+                screenshot_b64=None,
+                raw_output=untestable_reason,
+                untestable=True,
+            )
 
+    # AGENT_LOCAL_BROWSER=1 (défaut) → Chromium local via Playwright.
+    # Browserbase free-tier est trop instable côté WebSocket sur le 1er batch
+    # (6/8 deals ont crashé sur HTTP 410 / "5 consecutive failures"). Le
+    # bypass captcha est désormais assuré côté local par captcha_solver.py
+    # qui appelle CapSolver à chaque step si un hCaptcha/reCAPTCHA est détecté.
+    # Mettre AGENT_LOCAL_BROWSER=0 pour forcer Browserbase (debug).
+    use_local = os.getenv("AGENT_LOCAL_BROWSER", "1") in ("1", "true", "yes")
+    if use_local:
+        log.info("AGENT_LOCAL_BROWSER=1 → Playwright local (pas de Browserbase)")
+        session = BrowserSession(headless=True)
+        connect_url = "local"
+    else:
+        connect_url = reuse_session_url or _create_browserbase_session()
+        session = BrowserSession(cdp_url=connect_url)
+
+    # Agent (mécanique, ~30 steps × vision) — modèle moins cher par défaut.
+    # ANTHROPIC_MODEL_AGENT > ANTHROPIC_MODEL pour back-compat avec les
+    # anciennes configs qui n'avaient qu'une seule variable.
+    agent_model = (
+        os.getenv("ANTHROPIC_MODEL_AGENT")
+        or os.getenv("ANTHROPIC_MODEL")
+        or "claude-haiku-4-5-20251001"
+    )
     llm = ChatAnthropic(
-        model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        model=agent_model,
         api_key=os.environ["ANTHROPIC_API_KEY"],
         temperature=0,
     )
+    log.info("Agent LLM = %s", agent_model)
 
     objective = OBJECTIVE_TPL.format(
         target_url=target_url,
@@ -171,11 +289,32 @@ async def run_qa_for_deal(
             value=prefilled_otp,
         )
 
+    # Closure step-callback : à chaque step, on tente de résoudre le captcha
+    # sur la page courante. browser-use 0.12.6 invoque le callback avec
+    # (BrowserStateSummary, AgentOutput, n_steps) — donc on récupère la
+    # page via la `session` capturée plutôt que via les arguments.
+    async def _captcha_cb(state_summary, model_output, n_steps):
+        try:
+            page = await session.get_current_page()
+            if page is None:
+                return
+            try:
+                url = await page.get_url()
+            except Exception:
+                url = "?"
+            log.info("step %d captcha-cb fired (url=%s)", n_steps, url[:80])
+            solved = await solve_captcha_on_page(page)
+            if solved:
+                log.info("step %d : captcha résolu via CapSolver", n_steps)
+        except Exception as exc:
+            log.warning("step %d captcha cb failed: %s", n_steps, exc)
+
     agent = Agent(
         task=objective,
         llm=llm,
-        browser=browser,
-        message_context=_build_system_prompt(),
+        browser_session=session,
+        extend_system_message=_build_system_prompt(),
+        register_new_step_callback=_captcha_cb,
     )
 
     try:
@@ -192,16 +331,19 @@ async def run_qa_for_deal(
         )
     finally:
         try:
-            await browser.close()
+            await session.stop()
         except Exception:
             pass
 
     text = _coerce_to_text(history)
-    if "[UNTESTABLE_WALL]" in text:
+    # Fix 1 — scanner toute l'AgentHistory, pas juste final_result(), parce que
+    # browser-use perd le dernier sentinel quand l'agent stoppe sur "5 failures".
+    flags = _scan_history_for_sentinels(history)
+    if flags["untestable"]:
         return AgentResult(False, None, text, untestable=True, session_url=connect_url)
-    if "REQUIRE_PAID_SUBSCRIPTION" in text:
+    if flags["require_paid"]:
         return AgentResult(False, None, text, requires_paid=True, session_url=connect_url)
-    if "WAITING_FOR_EMAIL_CODE" in text and not prefilled_otp:
+    if flags["needs_otp"] and not prefilled_otp:
         return AgentResult(False, None, text, needs_otp=True, session_url=connect_url)
 
     screenshot = _extract_screenshot(history)

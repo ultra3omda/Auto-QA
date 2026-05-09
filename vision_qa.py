@@ -13,7 +13,13 @@ from dotenv import load_dotenv
 load_dotenv()
 log = logging.getLogger(__name__)
 
-_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+# Vision QA (1 appel par deal, lecture critique) — Sonnet par défaut.
+# ANTHROPIC_MODEL_VISION > ANTHROPIC_MODEL pour back-compat.
+_MODEL = (
+    os.getenv("ANTHROPIC_MODEL_VISION")
+    or os.getenv("ANTHROPIC_MODEL")
+    or "claude-sonnet-4-6"
+)
 _PROMPT_TPL = (
     "Tu es un agent QA. L'offre attendue est : {expected_offer}.\n\n"
     "Regarde ce panier de paiement et juge :\n"

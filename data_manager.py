@@ -73,18 +73,22 @@ def smart_qa_score(nom_partenaire: str) -> tuple[int, str]:
 # CSV -> DB column mapping
 # ---------------------------------------------------------------------------
 
-CSV_COLUMN_MAP: dict[str, str] = {
-    "Partenaire":                "nom_partenaire",
-    "URL Fiche Freelance.Stack": "url_fiche_freelance",
-    "Titre de l'offre":          "titre_offre",
-    "Offre détectée":            "offre_detectee",
-    "Mécanisme":                 "mecanisme",
-    "Code Promo 1":              "code_promo_1",
-    "Code Promo 2":              "code_promo_2",
-    "URL Partenaire 1":          "url_partenaire_1",
-    "URL Partenaire 2":          "url_partenaire_2",
-    "URL Partenaire 3":          "url_partenaire_3",
+# Mapping aligné sur les en-têtes du fichier Freelance Stack réel
+# (data/Liste des deals Freelance Stack .xlsx — feuille "Deals", 1 791 lignes).
+DEALS_COLUMN_MAP: dict[str, str] = {
+    "Nom partenaire":              "nom_partenaire",
+    "URL fiche Freelance Stack":   "url_fiche_freelance",
+    "Titre / Offre":               "titre_offre",
+    "Offre détectée (texte deal)": "offre_detectee",
+    "Mécanisme":                   "mecanisme",
+    "Code promo #1":               "code_promo_1",
+    "Code promo #2":               "code_promo_2",
+    "URL partenaire #1":           "url_partenaire_1",
+    "URL partenaire #2":           "url_partenaire_2",
+    "URL partenaire #3":           "url_partenaire_3",
 }
+# Backward-compat alias (le nom historique du spec).
+CSV_COLUMN_MAP = DEALS_COLUMN_MAP
 
 
 # ---------------------------------------------------------------------------
@@ -166,31 +170,43 @@ class SupabaseManager:
 def _normalize(value: Any) -> str | None:
     if value is None:
         return None
-    if isinstance(value, float) and pd.isna(value):
-        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
     text = str(value).strip()
     return text or None
 
 
-def import_csv_to_supabase(filepath: str | Path) -> int:
-    """Read partner CSV, compute Smart-QA scores, insert into Supabase.
+def _read_deals_file(path: Path) -> "pd.DataFrame":
+    """Read .xlsx / .xls / .csv into a string-typed DataFrame."""
+    suffix = path.suffix.lower()
+    if suffix in {".xlsx", ".xls"}:
+        return pd.read_excel(path, dtype=str)
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
 
-    Returns the number of rows inserted.
+
+def build_deal_rows(filepath: str | Path) -> tuple[list[dict[str, Any]], int]:
+    """Parse the deals file and return (rows_to_insert, skipped_count).
+
+    No DB call. Used both by `import_deals_file_to_supabase` and by tests /
+    dry-run scripts that need to validate the column mapping.
     """
     path = Path(filepath)
     if not path.exists():
         raise FileNotFoundError(path)
 
-    df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    df = _read_deals_file(path)
     log.info("Loaded %d rows from %s", len(df), path)
 
     rows: list[dict[str, Any]] = []
     skipped = 0
     for _, raw in df.iterrows():
         record: dict[str, Any] = {}
-        for csv_col, db_col in CSV_COLUMN_MAP.items():
-            if csv_col in raw.index:
-                record[db_col] = _normalize(raw[csv_col])
+        for src_col, db_col in DEALS_COLUMN_MAP.items():
+            if src_col in raw.index:
+                record[db_col] = _normalize(raw[src_col])
 
         nom = record.get("nom_partenaire")
         if not nom or not record.get("url_partenaire_1"):
@@ -206,6 +222,18 @@ def import_csv_to_supabase(filepath: str | Path) -> int:
             "date_prochain_test": datetime.now(timezone.utc).isoformat(),
         })
         rows.append(record)
+    return rows, skipped
 
+
+def import_deals_file_to_supabase(filepath: str | Path) -> int:
+    """Read partner deals file (.xlsx / .csv), compute Smart-QA, insert in Supabase.
+
+    Returns the number of rows inserted.
+    """
+    rows, skipped = build_deal_rows(filepath)
     log.info("Prepared %d rows (%d skipped — missing name or URL)", len(rows), skipped)
     return SupabaseManager().insert_deals(rows)
+
+
+# Backward-compat alias (le nom historique du spec).
+import_csv_to_supabase = import_deals_file_to_supabase

@@ -5,11 +5,16 @@ browserbase>=1.0.0
 
 # LLM
 anthropic>=0.40.0
-langchain-anthropic>=0.2.0
+# browser-use ≥0.12 ships its own LLM wrappers — langchain-anthropic n'est
+# plus nécessaire (browser_use.ChatAnthropic est utilisé dans agent_runner).
 
 # Backend & data
 supabase>=2.5.0
 pandas>=2.2.0
+openpyxl>=3.1.0   # lecture .xlsx (pandas read_excel)
+
+# Captcha bypass (local Playwright path)
+httpx>=0.27       # client REST CapSolver (déjà tiré par supabase-py)
 
 # Config
 python-dotenv>=1.0.1
