@@ -262,11 +262,20 @@ async def run_qa_for_deal(
         connect_url = reuse_session_url or _create_browserbase_session()
         session = BrowserSession(cdp_url=connect_url)
 
+    # Agent (mécanique, ~30 steps × vision) — modèle moins cher par défaut.
+    # ANTHROPIC_MODEL_AGENT > ANTHROPIC_MODEL pour back-compat avec les
+    # anciennes configs qui n'avaient qu'une seule variable.
+    agent_model = (
+        os.getenv("ANTHROPIC_MODEL_AGENT")
+        or os.getenv("ANTHROPIC_MODEL")
+        or "claude-haiku-4-5-20251001"
+    )
     llm = ChatAnthropic(
-        model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        model=agent_model,
         api_key=os.environ["ANTHROPIC_API_KEY"],
         temperature=0,
     )
+    log.info("Agent LLM = %s", agent_model)
 
     objective = OBJECTIVE_TPL.format(
         target_url=target_url,
